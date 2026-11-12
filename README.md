@@ -142,6 +142,14 @@ npm run lint
 node scripts/lint-destructive-warnings.mjs src
 ```
 
+## Read-only mode (IT Simply fork)
+
+This fork is read-only by default. Tools whose `annotations.readOnlyHint` is not exactly `true` (customer create/update/delete/whitelists, partner branding, scheduled report create/delete) are hidden from `tools/list` and `saas_alerts_navigate`, and a direct `tools/call` for one is refused before the SaaS Alerts client is ever invoked.
+
+- Env variable: `SAAS_ALERTS_ALLOW_WRITES`. Writes are enabled only when it is exactly `true`; any other value (`1`, `TRUE`, `yes`, empty, unset) keeps read-only on.
+- Why: defence in depth. Our gateway already blocks the write tools with its own allow-list; this is a second, independent layer inside the server. It uses the tools' own annotations, so a new upstream tool without a `readOnlyHint: true` is refused (fails closed) rather than silently exposed.
+- The test `src/__tests__/readOnly.test.ts` pins the exact list of read-only tools; an upstream sync that adds or renames a tool will fail it until reviewed.
+
 ## Destructive tool confirmation
 
 Tools that permanently delete data (customer delete, scheduled report delete) carry:

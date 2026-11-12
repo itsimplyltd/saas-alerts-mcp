@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fail-closed read-only mode (IT Simply fork, version `1.0.0-itsl1`). By
+  default only tools with `annotations.readOnlyHint === true` are listed,
+  shown by `saas_alerts_navigate` or callable; write tools are refused before
+  the SaaS Alerts client is invoked. Set `SAAS_ALERTS_ALLOW_WRITES=true`
+  (exactly) to enable writes.
+
 - Response byte budget for compact mode: compacted event responses are now
   capped at `MAX_COMPACT_RESPONSE_CHARS` (40,000 characters as serialized by
   the MCP layer). Over-budget hit lists keep only the first K events that fit

@@ -1,6 +1,7 @@
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
+import { logReadOnlyStartup } from './utils/readOnly.js';
 import { runWithCredentials } from './utils/client.js';
 import { logger } from './utils/logger.js';
 import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
@@ -180,6 +181,7 @@ function startHttpServer(): void {
     const addr = httpServer.address();
     const bound = typeof addr === 'object' && addr ? `${addr.address}:${addr.port}` : `${host}:${port}`;
     logger.info(`HTTP streaming server listening on ${bound}`);
+    logReadOnlyStartup();
   });
 }
 
