@@ -203,7 +203,24 @@ export type VerifyArgs = {
   // 'report': it does not; the result carries unsignedHeaderNames instead, so a
   // backend can learn which headers its platform adds before enforcing.
   headerRuleMode?: HeaderRuleMode;
+  // Lower-case exact header names a backend trusts as identity (tier, user, token...).
+  // A listed header that is present on the request but not covered by the signature
+  // fails with 'unsigned-required-header', in report AND enforce mode. A listed header
+  // that is absent is fine here (use the backend's own handling for absence). Validate
+  // the list once at configuration time with assertRequireSignedHeaders().
+  requireSignedHeaders?: string[];
 };
+
+// Throws on an invalid requireSignedHeaders list: anything that is not a plain
+// lower-case name, the signature header itself, or an exempt (unsigned) name. Call
+// once at configuration/boot time, never per request.
+export function assertRequireSignedHeaders(names: string[] | undefined): void {
+  for (const name of names ?? []) {
+    if (typeof name !== 'string' || !/^[a-z0-9-]+$/.test(name) || name === S2S_HEADER || INGRESS_EXEMPT_HEADERS.includes(name)) {
+      throw new Error(`requireSignedHeaders: invalid or exempt header name: ${String(name)}`);
+    }
+  }
+}
 
 // ok:true carries unsignedHeaderNames ONLY in report mode (possibly empty).
 export type VerifyV3Result = { ok: true; version: 3; unsignedHeaderNames?: string[] } | VerifyFailure;
@@ -263,6 +280,16 @@ export function verifyV3(a: VerifyArgs): VerifyV3Result {
 
   // skew.
   if (Math.abs(now - parsed.t) > S2S_SKEW_SECONDS) return fail('skew');
+
+  // required identity headers: present means signed (report and enforce mode alike).
+  // Before the blanket rule and the nonce, so a refusal here never consumes a slot.
+  if (a.requireSignedHeaders && a.requireSignedHeaders.length > 0) {
+    const signedSet = new Set(parsed.names);
+    for (const name of a.requireSignedHeaders) {
+      if (typeof name !== 'string' || !/^[a-z0-9-]+$/.test(name) || name === S2S_HEADER || INGRESS_EXEMPT_HEADERS.includes(name)) return fail('config');
+      if (counts.has(name) && !signedSet.has(name)) return fail('unsigned-required-header');
+    }
+  }
 
   // the blanket header rule: nothing sensitive that is neither signed nor
   // exempt. Exact names only; there are no prefix wildcards for exemptions.
@@ -411,6 +438,9 @@ export type GatewayOptions = {
   // Only a backend's explicit dev escape hatch may set this. Without it a missing
   // secret is a deployment fault: the request is refused, never served unauthenticated.
   allowUnauthenticated?: boolean;
+  // Passed to the verifier: see VerifyArgs.requireSignedHeaders. Validate with
+  // assertRequireSignedHeaders() at boot.
+  requireSignedHeaders?: string[];
 };
 
 export type VerifiedRequest = { version: number; parsedBody: unknown; headerRuleEnforced: boolean };
@@ -474,6 +504,7 @@ export async function handleGatewayRequest(
         minVersion: opts.minVersion,
         verifyLegacy: opts.verifyLegacy,
         headerRuleMode: 'report',
+        requireSignedHeaders: opts.requireSignedHeaders,
       });
       if (!check.ok) {
         logFailure(check.reason);

@@ -2466,5 +2466,93 @@
       "body": "abc",
       "expectStatus": 0
     }
+  ],
+  "requireSigned": [
+    {
+      "name": "required_listed_and_signed",
+      "from": "post_signed_headers",
+      "requireSignedHeaders": [
+        "x-example-header-a"
+      ],
+      "headerRuleMode": "report",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "required_listed_and_unsigned_report_mode",
+      "from": "post_no_signed_headers",
+      "extraRawHeaders": [
+        "x-mcp-tier",
+        "write"
+      ],
+      "requireSignedHeaders": [
+        "x-mcp-tier"
+      ],
+      "headerRuleMode": "report",
+      "expect": {
+        "ok": false,
+        "reason": "unsigned-required-header"
+      }
+    },
+    {
+      "name": "required_listed_and_unsigned_enforce_mode",
+      "from": "post_no_signed_headers",
+      "extraRawHeaders": [
+        "x-mcp-tier",
+        "write"
+      ],
+      "requireSignedHeaders": [
+        "x-mcp-tier"
+      ],
+      "headerRuleMode": "enforce",
+      "expect": {
+        "ok": false,
+        "reason": "unsigned-required-header"
+      }
+    },
+    {
+      "name": "required_listed_and_absent",
+      "from": "post_no_signed_headers",
+      "requireSignedHeaders": [
+        "x-mcp-tier"
+      ],
+      "headerRuleMode": "report",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "required_unlisted_unsigned_is_not_this_rule",
+      "from": "post_no_signed_headers",
+      "extraRawHeaders": [
+        "x-other",
+        "1"
+      ],
+      "requireSignedHeaders": [
+        "x-mcp-tier"
+      ],
+      "headerRuleMode": "report",
+      "expect": {
+        "ok": true
+      }
+    }
+  ],
+  "requireSignedConfigErrors": [
+    [
+      "x-request-id"
+    ],
+    [
+      "x-gateway-s2s"
+    ],
+    [
+      "X-Mcp-Tier"
+    ],
+    [
+      "x_mcp_tier"
+    ],
+    [
+      ""
+    ]
   ]
 }

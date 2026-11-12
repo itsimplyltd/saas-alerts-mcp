@@ -24,9 +24,9 @@ import {
   verifyV3,
 } from '../itsl/s2s-v3.js';
 
-// sha256 of itsimplyltd/MCP-Gateway s2s/s2s-v3.ts at commit e62a4c8 (branch feat/s2s-v3).
+// sha256 of itsimplyltd/MCP-Gateway s2s/s2s-v3.ts at commit f88a2e3 (branch feat/s2s-v3-cipp, PR 54).
 // Changing the vendored file means re-vendoring the canonical copy, never editing it here.
-const CANONICAL_S2S_V3_SHA256 = '8ac349ee876af734e11b4fadd9e24eefbfd1707086020990fb6c6ade4b0571d7';
+const CANONICAL_S2S_V3_SHA256 = '2242015a1df00772b695dddb1a49bee4af36cf139672a40d329394fed3a95374';
 
 describe('vendored verifier pin', () => {
   it('src/itsl/s2s-v3.ts is byte-identical to the canonical copy', () => {
