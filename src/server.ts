@@ -10,7 +10,7 @@ import { isAllowedTool, readOnlyRefusalText } from './utils/readOnly.js';
 
 export function createServer(): Server {
   const server = new Server(
-    { name: 'saas-alerts-mcp', version: '1.0.0-itsl1' },
+    { name: 'saas-alerts-mcp', version: '1.2.9-itsl1' },
     { capabilities: { tools: {}, logging: {}, prompts: {} } }
   );
 

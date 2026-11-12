@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Fail-closed read-only mode (IT Simply fork, version `1.0.0-itsl1`). By
+- Fail-closed read-only mode (IT Simply fork, version `1.2.9-itsl1`). By
   default only tools with `annotations.readOnlyHint === true` are listed,
   shown by `saas_alerts_navigate` or callable; write tools are refused before
   the SaaS Alerts client is invoked. Set `SAAS_ALERTS_ALLOW_WRITES=true`
