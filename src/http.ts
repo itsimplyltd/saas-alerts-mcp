@@ -4,7 +4,17 @@ import { createServer } from './server.js';
 import { logReadOnlyStartup, effectiveWriteMode, allowWritesForRequest, TIER_HEADER } from './utils/readOnly.js';
 import { runWithCredentials } from './utils/client.js';
 import { logger } from './utils/logger.js';
-import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
+import { verifyS2sHeader } from './s2s-verify.js';
+import {
+  NonceCache,
+  RawBodyError,
+  ReportRateLimiter,
+  checkGatewayRequest,
+  formatUnsignedHeaderReport,
+  readRawBody,
+  respondAndClose,
+  stripExemptHeaders,
+} from './itsl/s2s-v3.js';
 
 // Conduit service-to-service auth (gateway#377 parity). HTTP startup fails
 // closed. An empty CONDUIT_S2S_SECRET refuses to boot unless
@@ -42,7 +52,18 @@ const INSECURE_DEV_WARNING =
   'HTTP /mcp is starting with service-to-service authentication DISABLED, bound to 127.0.0.1 only. ' +
   'Local development only; do not expose this port.';
 
+const SHORT_S2S_SECRET_ERROR =
+  'Refusing to start HTTP server: CONDUIT_S2S_SECRET is shorter than 32 characters. ' +
+  'Generate a secret with `openssl rand -hex 32` and set CONDUIT_S2S_SECRET to that value.';
+
+const MIN_S2S_SECRET_LENGTH = 32;
+const S2S_AUDIENCE = 'saas-alerts';
+
 const LOOPBACK_HOST = '127.0.0.1';
+
+/** One per process: v3 nonces are single-use inside the skew window. */
+const nonceCache = new NonceCache();
+const reportRateLimiter = new ReportRateLimiter();
 
 /** Servers started by this module. Tests close them; production uses one. */
 export const httpServers: Server[] = [];
@@ -74,7 +95,13 @@ function resolveHttpS2sSecret(): string {
     logger.error(PLACEHOLDER_S2S_SECRET_ERROR);
     process.exit(1);
   }
-  if (raw) return raw;
+  if (raw) {
+    if (raw.length < MIN_S2S_SECRET_LENGTH) {
+      logger.error(SHORT_S2S_SECRET_ERROR);
+      process.exit(1);
+    }
+    return raw;
+  }
   if (process.env.MCP_ALLOW_INSECURE_DEV === '1') {
     // error level so LOG_LEVEL=warn|error cannot hide the bypass.
     logger.error(INSECURE_DEV_WARNING);
@@ -109,13 +136,25 @@ function startHttpServer(): void {
   // S2S is enforced only with a real secret (insecure-dev leaves it empty).
   const writeMode = effectiveWriteMode('http', Boolean(s2sSecret));
 
+  // Operator switch for the S2S v3 rollout. Anything that is not an integer 1..3
+  // is treated as 3 by the verifier (a typo can only tighten), so it is passed
+  // through untouched. The tier header is honoured only when the effective
+  // minimum is 3, because only then was the header rule enforced and the tier
+  // header therefore covered by the signature.
+  const minVersion = Number(process.env.ITSL_S2S_MIN_VERSION ?? '1');
+  const minVersionIsValid = Number.isInteger(minVersion) && minVersion >= 1 && minVersion <= 3;
+  const effectiveMinIsThree = !minVersionIsValid || minVersion === 3;
+
   const httpServer = createHttpServer(async (req, res) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    // Raw target, not a parsed URL: the signed path is exactly what was sent.
+    const rawTarget = req.url ?? '/';
+    const queryAt = rawTarget.indexOf('?');
+    const pathname = queryAt === -1 ? rawTarget : rawTarget.slice(0, queryAt);
 
     // Shallow, unauthenticated liveness probe. Always 200 while the process is
     // up. Must not read credentials: this route is unauthenticated, and gateway
     // mode has no process-level vendor credentials to report.
-    if (url.pathname === '/health' || url.pathname === '/healthz') {
+    if (pathname === '/health' || pathname === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
@@ -125,23 +164,76 @@ function startHttpServer(): void {
       return;
     }
 
-    if (url.pathname !== '/mcp') {
+    if (pathname !== '/mcp') {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found', endpoints: ['/mcp', '/health', '/healthz'] }));
       return;
     }
 
+    // S2S first: before method checks, credential extraction or anything else.
     // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1; startup
-    // refuses otherwise. A configured secret is always enforced, before any
-    // credential extraction.
-    if (s2sSecret && !verifyS2sHeader(headerValue(req.headers[S2S_HEADER]), s2sSecret)) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          error: 'Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.',
-        }),
-      );
-      return;
+    // refuses otherwise. A configured secret is always enforced.
+    let body: Buffer;
+    try {
+      body = await readRawBody(req);
+    } catch (err) {
+      if (err instanceof RawBodyError) {
+        respondAndClose(res, err.status, JSON.stringify({ error: 'Request body rejected' }));
+        return;
+      }
+      throw err;
+    }
+
+    let verifiedVersion = 0;
+    if (s2sSecret) {
+      const check = checkGatewayRequest({
+        method: req.method ?? '',
+        rawTarget,
+        body,
+        rawHeaders: req.rawHeaders,
+        secret: s2sSecret,
+        aud: S2S_AUDIENCE,
+        nonceCache,
+        floor: 1,
+        minVersion,
+        verifyLegacy: (headerValue) => (verifyS2sHeader(headerValue, s2sSecret) ? 1 : 0),
+        headerRuleMode: 'report',
+      });
+      if (!check.ok) {
+        // Reason only, never header values.
+        logger.warn('S2S verification failed', { reason: check.reason });
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: 'Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.',
+          }),
+        );
+        return;
+      }
+      verifiedVersion = check.version;
+      if (check.version === 3) {
+        // Remove the unsigned, ingress-rewritable headers before the app sees them.
+        stripExemptHeaders(req);
+        const unsigned = check.unsignedHeaderNames;
+        if (unsigned && unsigned.length > 0) {
+          const names = formatUnsignedHeaderReport(unsigned);
+          if (reportRateLimiter.shouldEmit(names)) {
+            logger.warn('S2S v3 request carried unsigned headers', { unsignedHeaders: names });
+          }
+        }
+      }
+      logger.debug('S2S verified', { version: verifiedVersion });
+    }
+
+    let parsedBody: unknown;
+    if (body.length > 0) {
+      try {
+        parsedBody = JSON.parse(body.toString('utf8'));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+        return;
+      }
     }
 
     const apiKey = headerValue(req.headers['x-saas-alerts-api-key']);
@@ -158,11 +250,13 @@ function startHttpServer(): void {
     }
 
     const handle = async () => {
-      // Tier header is trusted only when S2S verified this request (secret non-empty
-      // means the check above already passed); otherwise writeMode is never per-request.
+      // Tier header is trusted only when this request verified as v3 AND the
+      // effective minimum is 3: only then was the header rule enforced, so the
+      // header was covered by the signature. Anything else is treated as read.
+      const tierTrusted = verifiedVersion === 3 && effectiveMinIsThree;
       const allowWrites = allowWritesForRequest(
         writeMode,
-        writeMode === 'per-request' ? exactHeader(req.headers[TIER_HEADER]) : undefined,
+        writeMode === 'per-request' && tierTrusted ? exactHeader(req.headers[TIER_HEADER]) : undefined,
       );
       const server = createServer({ allowWrites });
       // SECURITY-CRITICAL invariant: this transport MUST stay stateless
@@ -179,7 +273,7 @@ function startHttpServer(): void {
       });
       res.on('close', () => { transport.close(); server.close(); });
       await server.connect(transport);
-      await transport.handleRequest(req, res);
+      await transport.handleRequest(req, res, parsedBody);
     };
 
     if (isGatewayMode && apiKey) {

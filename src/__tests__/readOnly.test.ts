@@ -5,7 +5,7 @@
  * or renames a tool, this test fails and forces a conscious review of whether
  * the new tool is a read or a write.
  */
-import { createHmac } from 'node:crypto';
+import { signV3 } from './helpers/s2sV3Signer.js';
 import type { Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -204,7 +204,7 @@ describe('read-only mode over S2S HTTP', () => {
   const SECRET = 'test-readonly-s2s-secret-do-not-use-in-prod';
   const keys = [
     'MCP_TRANSPORT', 'AUTH_MODE', 'MCP_HTTP_PORT', 'MCP_HTTP_HOST', 'CONDUIT_S2S_SECRET',
-    'MCP_ALLOW_INSECURE_DEV', 'LOG_LEVEL',
+    'MCP_ALLOW_INSECURE_DEV', 'LOG_LEVEL', 'ITSL_S2S_MIN_VERSION',
   ];
   const saved = Object.fromEntries(keys.map(k => [k, process.env[k]]));
   let httpServer: HttpServer | undefined;
@@ -218,10 +218,6 @@ describe('read-only mode over S2S HTTP', () => {
     }
   });
 
-  function mint(): string {
-    const t = `t=${Math.floor(Date.now() / 1000)}`;
-    return `${t},v1=${createHmac('sha256', SECRET).update(t).digest('hex')}`;
-  }
 
   async function start(mode: string | undefined, signed = true): Promise<number> {
     process.env.MCP_TRANSPORT = 'http';
@@ -229,6 +225,9 @@ describe('read-only mode over S2S HTTP', () => {
     process.env.MCP_HTTP_PORT = '0';
     delete process.env.MCP_HTTP_HOST;
     process.env.LOG_LEVEL = 'error';
+    // The tier header is only honoured for a v3 request at a minimum of 3, where
+    // the header rule is enforced and the header therefore signed.
+    process.env.ITSL_S2S_MIN_VERSION = '3';
     if (signed) {
       process.env.CONDUIT_S2S_SECRET = SECRET;
       delete process.env.MCP_ALLOW_INSECURE_DEV;
@@ -255,12 +254,17 @@ describe('read-only mode over S2S HTTP', () => {
       Accept: 'application/json, text/event-stream',
       'x-saas-alerts-api-key': 'header-key',
     };
-    if (signed) headers['x-gateway-s2s'] = mint();
     if (tier !== undefined) headers['x-saas-alerts-tier'] = tier;
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+    if (signed) {
+      const signedHeaders: Record<string, string> = { 'x-saas-alerts-api-key': 'header-key' };
+      if (tier !== undefined) signedHeaders['x-saas-alerts-tier'] = tier;
+      headers['x-gateway-s2s'] = signV3(SECRET, { aud: 'saas-alerts', method: 'POST', path: '/mcp', body, headers: signedHeaders });
+    }
     const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      body,
     });
     expect(res.status).toBe(200);
     return (await res.json()) as Rpc;
