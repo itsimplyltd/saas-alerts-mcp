@@ -158,6 +158,22 @@ describe('SAAS_ALERTS_WRITE_MODE (stdio / in-process default)', () => {
     expect(textOf(nav)).toContain('saas_alerts_customers_create');
   });
 
+  it('pins the FULL tool set: all 30 names with their expected readOnlyHint', async () => {
+    process.env.SAAS_ALERTS_WRITE_MODE = 'on';
+    const { tools } = await (await connect()).listTools();
+    const actual = Object.fromEntries(
+      [...tools].sort((a, b) => a.name.localeCompare(b.name)).map(t => [t.name, t.annotations?.readOnlyHint])
+    );
+    const expected = Object.fromEntries(
+      [...READ_ONLY_TOOLS.map(n => [n, true] as const), ...WRITE_TOOLS.map(n => [n, false] as const)].sort((a, b) =>
+        a[0].localeCompare(b[0])
+      )
+    );
+    // Fails on any added/removed tool or changed annotation (e.g. a write relabelled read-only).
+    expect(actual).toEqual(expected);
+    expect(Object.keys(actual)).toHaveLength(30);
+  });
+
   it('off lists 22', async () => {
     process.env.SAAS_ALERTS_WRITE_MODE = 'off';
     expect(await listNames(await connect())).toHaveLength(22);
