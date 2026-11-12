@@ -1,16 +1,17 @@
 name: Release
 
+# DISABLED by IT Simply (2026-11-12): this pipeline publishes a release, pushes a Docker image to
+# ghcr.io/wyre-ai and publishes to the MCP Registry, none of which this fork may do. Manual-only.
+# The gate is .github/workflows/itsl-gate.yml.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch: {}
 
 # Thin caller for the canonical reusable release pipeline (build →
 # semantic-release → Docker → MCP Registry → security). Lives in
 # WYRE-AI/.github so every *-mcp repo stays in lockstep.
 jobs:
   release:
+    if: false
     permissions:
       contents: write
       issues: write
