@@ -4,6 +4,7 @@
  * for a v3 request when the effective minimum is 3.
  */
 import { createHmac } from 'node:crypto';
+import { connect } from 'node:net';
 import { request as httpRequest, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -301,5 +302,39 @@ describe('boot', () => {
     vi.resetModules();
     await expect(import('../http.js')).rejects.toThrow('process.exit:1');
     expect(exit).toHaveBeenCalledWith(1);
+  });
+});
+
+describe('robustness', () => {
+  it('survives a client that aborts mid-body: /health still answers afterwards', async () => {
+    const { port } = await start();
+    const a = v3Request();
+    const sock = connect(port, '127.0.0.1');
+    await new Promise<void>((r) => sock.once('connect', () => r()));
+    sock.write(`POST /mcp HTTP/1.1\r\nHost: x\r\nX-Gateway-S2S: ${a.headers['x-gateway-s2s']}\r\nContent-Length: 1000\r\n\r\n0123456789`);
+    await new Promise((r) => setTimeout(r, 100));
+    sock.destroy();
+    await new Promise((r) => setTimeout(r, 100));
+    expect((await send(port, { method: 'GET', path: '/health' })).status).toBe(200);
+  });
+
+  it('answers 400 for a verified POST with an empty body', async () => {
+    const { port } = await start();
+    const a = v3Request({ body: '' });
+    expect((await send(port, { headers: a.headers, body: '' })).status).toBe(400);
+  });
+
+  it('answers 401 without reading the body when there is no S2S header', async () => {
+    const { port } = await start();
+    const sock = connect(port, '127.0.0.1');
+    await new Promise<void>((r) => sock.once('connect', () => r()));
+    const got = new Promise<string>((resolve) => {
+      let b = '';
+      sock.on('data', (d) => { b += d; if (b.includes('\r\n\r\n')) resolve(b); });
+    });
+    sock.write('POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 4000000\r\n\r\n0123456789');
+    const text = await Promise.race([got, new Promise<string>((r) => setTimeout(() => r('TIMEOUT'), 1500))]);
+    sock.destroy();
+    expect(text).toMatch(/^HTTP\/1\.1 401/);
   });
 });

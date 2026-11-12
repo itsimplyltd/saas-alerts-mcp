@@ -5,16 +5,7 @@ import { logReadOnlyStartup, effectiveWriteMode, allowWritesForRequest, TIER_HEA
 import { runWithCredentials } from './utils/client.js';
 import { logger } from './utils/logger.js';
 import { verifyS2sHeader } from './s2s-verify.js';
-import {
-  NonceCache,
-  RawBodyError,
-  ReportRateLimiter,
-  checkGatewayRequest,
-  formatUnsignedHeaderReport,
-  readRawBody,
-  respondAndClose,
-  stripExemptHeaders,
-} from './itsl/s2s-v3.js';
+import { NonceCache, ReportRateLimiter, handleGatewayRequest } from './itsl/s2s-v3.js';
 
 // Conduit service-to-service auth (gateway#377 parity). HTTP startup fails
 // closed. An empty CONDUIT_S2S_SECRET refuses to boot unless
@@ -64,6 +55,7 @@ const LOOPBACK_HOST = '127.0.0.1';
 /** One per process: v3 nonces are single-use inside the skew window. */
 const nonceCache = new NonceCache();
 const reportRateLimiter = new ReportRateLimiter();
+const failureLimiter = new ReportRateLimiter();
 
 /** Servers started by this module. Tests close them; production uses one. */
 export const httpServers: Server[] = [];
@@ -136,14 +128,9 @@ function startHttpServer(): void {
   // S2S is enforced only with a real secret (insecure-dev leaves it empty).
   const writeMode = effectiveWriteMode('http', Boolean(s2sSecret));
 
-  // Operator switch for the S2S v3 rollout. Anything that is not an integer 1..3
-  // is treated as 3 by the verifier (a typo can only tighten), so it is passed
-  // through untouched. The tier header is honoured only when the effective
-  // minimum is 3, because only then was the header rule enforced and the tier
-  // header therefore covered by the signature.
+  // Operator switch for the S2S v3 rollout. Passed through raw: anything that is
+  // not an integer 1..3 is treated as 3 by the verifier (a typo can only tighten).
   const minVersion = Number(process.env.ITSL_S2S_MIN_VERSION ?? '1');
-  const minVersionIsValid = Number.isInteger(minVersion) && minVersion >= 1 && minVersion <= 3;
-  const effectiveMinIsThree = !minVersionIsValid || minVersion === 3;
 
   const httpServer = createHttpServer(async (req, res) => {
     // Raw target, not a parsed URL: the signed path is exactly what was sent.
@@ -170,117 +157,73 @@ function startHttpServer(): void {
       return;
     }
 
-    // S2S first: before method checks, credential extraction or anything else.
-    // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1; startup
-    // refuses otherwise. A configured secret is always enforced.
-    let body: Buffer;
-    try {
-      body = await readRawBody(req);
-    } catch (err) {
-      if (err instanceof RawBodyError) {
-        respondAndClose(res, err.status, JSON.stringify({ error: 'Request body rejected' }));
-        return;
-      }
-      throw err;
-    }
-
-    let verifiedVersion = 0;
-    if (s2sSecret) {
-      const check = checkGatewayRequest({
-        method: req.method ?? '',
-        rawTarget,
-        body,
-        rawHeaders: req.rawHeaders,
-        secret: s2sSecret,
+    // The shared wrapper runs the S2S check FIRST (before method checks or
+    // credential extraction), reads the body once, and never rejects: an aborted
+    // upload or a throwing handler ends that request, not the process. Empty
+    // s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1; startup
+    // refuses otherwise.
+    await handleGatewayRequest(
+      req,
+      res,
+      {
+        secret: s2sSecret || undefined,
         aud: S2S_AUDIENCE,
-        nonceCache,
         floor: 1,
         minVersion,
         verifyLegacy: (headerValue) => (verifyS2sHeader(headerValue, s2sSecret) ? 1 : 0),
-        headerRuleMode: 'report',
-      });
-      if (!check.ok) {
-        // Reason only, never header values.
-        logger.warn('S2S verification failed', { reason: check.reason });
+        nonceCache,
+        reportLimiter: reportRateLimiter,
+        failureLimiter,
+        logger,
+      },
+      async ({ version, parsedBody, headerRuleEnforced }) => {
+      const apiKey = headerValue(req.headers['x-saas-alerts-api-key']);
+
+      // Gateway mode: the API key must arrive on every request. Reject explicitly
+      // if it is missing rather than falling through — falling through would
+      // resolve SAAS_ALERTS_API_KEY from the process environment (CWE-306).
+      if (isGatewayMode && !apiKey) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: 'Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.',
-          }),
+        res.end(JSON.stringify({
+          error: 'Unauthorized: missing required gateway credential header X-SaaS-Alerts-API-Key',
+        }));
+        return;
+      }
+
+      const handle = async () => {
+        // Tier header is trusted only when this request verified as v3 AND the
+        // header rule was enforced (effective minimum 3): only then was the
+        // header covered by the signature. Anything else is treated as read.
+        const tierTrusted = version === 3 && headerRuleEnforced;
+        const allowWrites = allowWritesForRequest(
+          writeMode,
+          writeMode === 'per-request' && tierTrusted ? exactHeader(req.headers[TIER_HEADER]) : undefined,
         );
-        return;
+        const server = createServer({ allowWrites });
+        // SECURITY-CRITICAL invariant: this transport MUST stay stateless
+        // (sessionIdGenerator: undefined + enableJsonResponse: true). Per-request
+        // tenant credentials are carried in an AsyncLocalStorage context opened by
+        // runWithCredentials() below. A stateless request->single-response flow
+        // keeps the tool call inside that context. Switching to a stateful/SSE
+        // transport (sessionIdGenerator set, persistent stream) would let a
+        // long-lived connection serve later messages under a stale/foreign
+        // credential context — re-review tenant isolation before changing this.
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined,
+          enableJsonResponse: true,
+        });
+        res.on('close', () => { transport.close(); server.close(); });
+        await server.connect(transport);
+        await transport.handleRequest(req, res, parsedBody);
+      };
+
+      if (isGatewayMode && apiKey) {
+        await runWithCredentials({ apiKey }, handle);
+      } else {
+        await handle();
       }
-      verifiedVersion = check.version;
-      if (check.version === 3) {
-        // Remove the unsigned, ingress-rewritable headers before the app sees them.
-        stripExemptHeaders(req);
-        const unsigned = check.unsignedHeaderNames;
-        if (unsigned && unsigned.length > 0) {
-          const names = formatUnsignedHeaderReport(unsigned);
-          if (reportRateLimiter.shouldEmit(names)) {
-            logger.warn('S2S v3 request carried unsigned headers', { unsignedHeaders: names });
-          }
-        }
-      }
-      logger.debug('S2S verified', { version: verifiedVersion });
-    }
-
-    let parsedBody: unknown;
-    if (body.length > 0) {
-      try {
-        parsedBody = JSON.parse(body.toString('utf8'));
-      } catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
-        return;
-      }
-    }
-
-    const apiKey = headerValue(req.headers['x-saas-alerts-api-key']);
-
-    // Gateway mode: the API key must arrive on every request. Reject explicitly
-    // if it is missing rather than falling through — falling through would
-    // resolve SAAS_ALERTS_API_KEY from the process environment (CWE-306).
-    if (isGatewayMode && !apiKey) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: 'Unauthorized: missing required gateway credential header X-SaaS-Alerts-API-Key',
-      }));
-      return;
-    }
-
-    const handle = async () => {
-      // Tier header is trusted only when this request verified as v3 AND the
-      // effective minimum is 3: only then was the header rule enforced, so the
-      // header was covered by the signature. Anything else is treated as read.
-      const tierTrusted = verifiedVersion === 3 && effectiveMinIsThree;
-      const allowWrites = allowWritesForRequest(
-        writeMode,
-        writeMode === 'per-request' && tierTrusted ? exactHeader(req.headers[TIER_HEADER]) : undefined,
-      );
-      const server = createServer({ allowWrites });
-      // SECURITY-CRITICAL invariant: this transport MUST stay stateless
-      // (sessionIdGenerator: undefined + enableJsonResponse: true). Per-request
-      // tenant credentials are carried in an AsyncLocalStorage context opened by
-      // runWithCredentials() below. A stateless request->single-response flow
-      // keeps the tool call inside that context. Switching to a stateful/SSE
-      // transport (sessionIdGenerator set, persistent stream) would let a
-      // long-lived connection serve later messages under a stale/foreign
-      // credential context — re-review tenant isolation before changing this.
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true,
-      });
-      res.on('close', () => { transport.close(); server.close(); });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, parsedBody);
-    };
-
-    if (isGatewayMode && apiKey) {
-      await runWithCredentials({ apiKey }, handle);
-    } else {
-      await handle();
-    }
+      },
+    );
   });
 
   httpServers.push(httpServer);

@@ -297,14 +297,21 @@ export type CheckResult =
 // v2/v3, 3 accepts v3 only. verifyLegacy returns the legacy version the header
 // verified as (1 or 2) or 0. Legacy headers get no header rule (they were never
 // bound to headers) and carry no unsignedHeaderNames.
+// The effective minimum version: max(floor, minVersion), where an invalid
+// floor or minVersion (not an integer 1..3) counts as 3. Used by
+// checkGatewayRequest and handleGatewayRequest so the two cannot drift.
+export function effectiveMinVersion(floor: number, minVersion: number): number {
+  const validMin = Number.isInteger(minVersion) && minVersion >= 1 && minVersion <= 3 ? minVersion : 3;
+  const validFloor = Number.isInteger(floor) && floor >= 1 && floor <= 3 ? floor : 3;
+  return Math.max(validFloor, validMin);
+}
+
 export function checkGatewayRequest(a: VerifyArgs & {
   floor: 1 | 2 | 3;
   minVersion: number;
   verifyLegacy?: (headerValue: string) => number;
 }): CheckResult {
-  const validMin = Number.isInteger(a.minVersion) && a.minVersion >= 1 && a.minVersion <= 3 ? a.minVersion : 3;
-  const validFloor = Number.isInteger(a.floor) && a.floor >= 1 && a.floor <= 3 ? a.floor : 3;
-  const effective = Math.max(validFloor, validMin);
+  const effective = effectiveMinVersion(a.floor, a.minVersion);
   const counts = countHeaders(a.rawHeaders);
   if (counts.get(S2S_HEADER) !== 1) return { ok: false, version: 0, reason: 'header-count' };
   const headerValue = headerValueOf(a.rawHeaders, S2S_HEADER);
@@ -363,8 +370,8 @@ export class ReportRateLimiter {
     this.windowSeconds = windowSeconds;
     this.last = new Map();
   }
-  shouldEmit(names: string[], now: number = nowSecondsDefault()): boolean {
-    const key = [...names].sort().join(';');
+  shouldEmit(names: string[] | string, now: number = nowSecondsDefault()): boolean {
+    const key = typeof names === 'string' ? names : [...names].sort().join(';');
     const prev = this.last.get(key);
     if (prev !== undefined && now - prev < this.windowSeconds) return false;
     this.last.delete(key);
@@ -374,5 +381,139 @@ export class ReportRateLimiter {
       this.last.delete(oldest);
     }
     return true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The shared request wrapper. Every backend's /mcp handler goes through this, so
+// the guard is identical everywhere. The returned promise NEVER rejects: an
+// aborted upload, a throwing handler or a bad body ends THAT request, not the
+// process (there is no unhandledRejection handler in the backends).
+// ---------------------------------------------------------------------------
+
+export type GatewayLogger = {
+  warn(msg: string, meta?: Record<string, unknown>): void;
+  error(msg: string, meta?: Record<string, unknown>): void;
+  debug?(msg: string, meta?: Record<string, unknown>): void;
+};
+
+export type GatewayOptions = {
+  secret: string | undefined; // empty/undefined => S2S disabled (only via each backend's dev escape hatch)
+  aud: string;
+  floor: 1 | 2 | 3;
+  minVersion: number; // raw, unvalidated (the verifier treats invalid as 3)
+  verifyLegacy?: (headerValue: string) => number;
+  nonceCache: NonceCache;
+  reportLimiter: ReportRateLimiter;
+  failureLimiter: ReportRateLimiter; // keyed by reason
+  logger: GatewayLogger;
+  bodyLimitBytes?: number; // default 5 MB
+};
+
+export type VerifiedRequest = { version: number; parsedBody: unknown; headerRuleEnforced: boolean };
+
+const GENERIC_401 = '{"error":"Missing or invalid X-Gateway-S2S header"}';
+const BODY_METHODS = ['POST', 'PUT', 'PATCH'];
+
+export async function handleGatewayRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: GatewayOptions,
+  onVerified: (v: VerifiedRequest) => Promise<void> | void,
+): Promise<void> {
+  try {
+    const secret = opts.secret;
+    const logFailure = (reason: string): void => {
+      if (opts.failureLimiter.shouldEmit(reason)) opts.logger.warn('S2S verification failed', { reason });
+    };
+
+    // 1. Nothing is buffered for a request that cannot verify.
+    if (secret && countHeaders(req.rawHeaders).get(S2S_HEADER) !== 1) {
+      logFailure('header-count');
+      respondAndClose(res, 401, GENERIC_401);
+      return;
+    }
+
+    // 2. Read the exact bytes. A socket abort is not our error to answer.
+    let body: Buffer;
+    try {
+      body = await readRawBody(req, opts.bodyLimitBytes);
+    } catch (err) {
+      if (err instanceof RawBodyError) {
+        respondAndClose(res, err.status, JSON.stringify({ error: 'Request body rejected' }));
+      } else {
+        req.destroy();
+        res.destroy();
+      }
+      return;
+    }
+
+    // 3. Verify.
+    let version = 0;
+    let headerRuleEnforced = false;
+    if (secret) {
+      const check = checkGatewayRequest({
+        method: req.method ?? '',
+        rawTarget: req.url ?? '',
+        body,
+        rawHeaders: req.rawHeaders,
+        secret,
+        aud: opts.aud,
+        nonceCache: opts.nonceCache,
+        floor: opts.floor,
+        minVersion: opts.minVersion,
+        verifyLegacy: opts.verifyLegacy,
+        headerRuleMode: 'report',
+      });
+      if (!check.ok) {
+        logFailure(check.reason);
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(GENERIC_401);
+        return;
+      }
+      version = check.version;
+      if (version === 3) {
+        stripExemptHeaders(req);
+        const unsigned = check.unsignedHeaderNames;
+        if (unsigned && unsigned.length > 0) {
+          const names = formatUnsignedHeaderReport(unsigned);
+          if (opts.reportLimiter.shouldEmit(names)) opts.logger.warn('S2S v3 request carried unsigned headers', { unsignedHeaders: names });
+        }
+        headerRuleEnforced = effectiveMinVersion(opts.floor, opts.minVersion) === 3;
+      }
+      opts.logger.debug?.('S2S verified', { version });
+    }
+
+    // 4. Body.
+    let parsedBody: unknown;
+    if (body.length === 0) {
+      if (BODY_METHODS.includes((req.method ?? '').toUpperCase())) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end('{"error":"Empty body"}');
+        return;
+      }
+    } else {
+      try {
+        parsedBody = JSON.parse(body.toString('utf8'));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end('{"error":"Invalid JSON body"}');
+        return;
+      }
+    }
+
+    // 5. The backend's own handling.
+    await onVerified({ version, parsedBody, headerRuleEnforced });
+  } catch (err) {
+    // 6. Never rethrow. Message only: no headers, no body.
+    try { opts.logger.error('gateway request failed', { error: String((err as Error)?.message ?? err) }); } catch { /* logging must not throw */ }
+    try {
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json', Connection: 'close' });
+        res.end('{"error":"internal_error"}');
+      } else {
+        res.destroy();
+      }
+    } catch { /* already gone */ }
   }
 }
