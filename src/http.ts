@@ -1,6 +1,7 @@
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
+import { logReadOnlyStartup, effectiveWriteMode, allowWritesForRequest, TIER_HEADER } from './utils/readOnly.js';
 import { runWithCredentials } from './utils/client.js';
 import { logger } from './utils/logger.js';
 import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
@@ -52,6 +53,11 @@ function headerValue(value: string | string[] | undefined): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/** Untrimmed on purpose: the tier header must match exactly. */
+function exactHeader(value: string | string[] | undefined): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
 function isLoopbackHost(host: string): boolean {
   const normalized = host.trim().toLowerCase().replace(/^\[(.+)\]$/, '$1');
   return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1';
@@ -100,6 +106,8 @@ function startHttpServer(): void {
   const port = parseInt(process.env.MCP_HTTP_PORT || '8080', 10);
   const host = resolveListenHost(s2sSecret);
   const isGatewayMode = process.env.AUTH_MODE === 'gateway';
+  // S2S is enforced only with a real secret (insecure-dev leaves it empty).
+  const writeMode = effectiveWriteMode('http', Boolean(s2sSecret));
 
   const httpServer = createHttpServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -150,7 +158,13 @@ function startHttpServer(): void {
     }
 
     const handle = async () => {
-      const server = createServer();
+      // Tier header is trusted only when S2S verified this request (secret non-empty
+      // means the check above already passed); otherwise writeMode is never per-request.
+      const allowWrites = allowWritesForRequest(
+        writeMode,
+        writeMode === 'per-request' ? exactHeader(req.headers[TIER_HEADER]) : undefined,
+      );
+      const server = createServer({ allowWrites });
       // SECURITY-CRITICAL invariant: this transport MUST stay stateless
       // (sessionIdGenerator: undefined + enableJsonResponse: true). Per-request
       // tenant credentials are carried in an AsyncLocalStorage context opened by
@@ -180,6 +194,7 @@ function startHttpServer(): void {
     const addr = httpServer.address();
     const bound = typeof addr === 'object' && addr ? `${addr.address}:${addr.port}` : `${host}:${port}`;
     logger.info(`HTTP streaming server listening on ${bound}`);
+    logReadOnlyStartup(writeMode);
   });
 }
 

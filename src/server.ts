@@ -6,10 +6,18 @@ import { getCredentials } from './utils/client.js';
 import { logger } from './utils/logger.js';
 import type { DomainName } from './utils/types.js';
 import { registerPromptHandlers } from './prompts.js';
+import { isAllowedTool, readOnlyRefusalText, effectiveWriteMode, allowWritesForRequest } from './utils/readOnly.js';
 
-export function createServer(): Server {
+export interface CreateServerOptions {
+  /** Per-request write decision. Defaults to the env mode (stdio: 'on' only). */
+  allowWrites?: boolean;
+}
+
+export function createServer(options: CreateServerOptions = {}): Server {
+  const allowWrites =
+    options.allowWrites ?? allowWritesForRequest(effectiveWriteMode('stdio', false), undefined);
   const server = new Server(
-    { name: 'saas-alerts-mcp', version: '1.0.0' },
+    { name: 'saas-alerts-mcp', version: '1.2.9-itsl1' },
     { capabilities: { tools: {}, logging: {}, prompts: {} } }
   );
 
@@ -21,11 +29,26 @@ export function createServer(): Server {
       const handler = await getDomainHandler(domain);
       allTools.push(...handler.getTools());
     }
-    return { tools: allTools };
+    return { tools: allTools.filter(t => isAllowedTool(t, allowWrites)) };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
+
+    // Second-layer read-only guard: resolve the tool object by name and refuse
+    // BEFORE any handler (and so any SaaS Alerts client call) runs.
+    const known = [...getNavigationTools()];
+    for (const domain of DOMAINS) {
+      known.push(...(await getDomainHandler(domain)).getTools());
+    }
+    const tool = known.find(t => t.name === name);
+    if (tool && !isAllowedTool(tool, allowWrites)) {
+      logger.warn('Refused tool call: read-only mode', { tool: name });
+      return {
+        content: [{ type: 'text' as const, text: readOnlyRefusalText(name) }],
+        isError: true,
+      };
+    }
 
     if (name === 'saas_alerts_navigate') {
       const domain = (args?.domain as string) as DomainName;
@@ -36,7 +59,7 @@ export function createServer(): Server {
         };
       }
       const handler = await getDomainHandler(domain);
-      const tools = handler.getTools().map(t => `${t.name}: ${t.description}`);
+      const tools = handler.getTools().filter(t => isAllowedTool(t, allowWrites)).map(t => `${t.name}: ${t.description}`);
       return {
         content: [{ type: 'text' as const, text: `Domain: ${domain}\n\nAvailable tools:\n${tools.join('\n')}` }],
       };

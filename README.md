@@ -142,6 +142,24 @@ npm run lint
 node scripts/lint-destructive-warnings.mjs src
 ```
 
+## Read-only mode (IT Simply fork)
+
+This fork is read-only by default. Tools whose `annotations.readOnlyHint` is not exactly `true` (customer create/update/delete/whitelists, partner branding, scheduled report create/delete) are hidden from `tools/list` and `saas_alerts_navigate`, and a `tools/call` for one is refused before the SaaS Alerts client is ever invoked. The decision uses the tools' own annotations, so a new upstream tool without `readOnlyHint: true` is refused (fails closed).
+
+One env variable, `SAAS_ALERTS_WRITE_MODE`, exact lowercase value. Anything else, including unset, empty or a wrong case, means `off`:
+
+| Value | Behaviour |
+| --- | --- |
+| `off` (default) | Read-only. |
+| `on` | All tools allowed (standalone use). |
+| `per-request` | Read-only unless the incoming HTTP request carries `X-SaaS-Alerts-Tier: write` (exact value). Any other value, or no header, is read-only for that request. |
+
+`per-request` is only valid over HTTP with S2S enforced (`CONDUIT_S2S_SECRET` set, `MCP_ALLOW_INSECURE_DEV` off). On stdio, or with S2S off, the server logs an error and treats it as `off`; the header is ignored.
+
+The gateway decides the tier: it authenticates the user, works out whether they hold the write role, and sets `X-SaaS-Alerts-Tier` on the request it signs with `X-Gateway-S2S`. The header is only trustworthy behind an authenticating gateway, which is why S2S verification is required before it is honoured. This lets one backend container serve both read and write roles.
+
+This is defence in depth: the gateway also blocks write tools with its own allow-list. `src/__tests__/readOnly.test.ts` pins the exact list of read-only tools, so an upstream sync that adds or renames a tool fails it until reviewed.
+
 ## Destructive tool confirmation
 
 Tools that permanently delete data (customer delete, scheduled report delete) carry:
