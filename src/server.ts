@@ -6,9 +6,16 @@ import { getCredentials } from './utils/client.js';
 import { logger } from './utils/logger.js';
 import type { DomainName } from './utils/types.js';
 import { registerPromptHandlers } from './prompts.js';
-import { isAllowedTool, readOnlyRefusalText } from './utils/readOnly.js';
+import { isAllowedTool, readOnlyRefusalText, effectiveWriteMode, allowWritesForRequest } from './utils/readOnly.js';
 
-export function createServer(): Server {
+export interface CreateServerOptions {
+  /** Per-request write decision. Defaults to the env mode (stdio: 'on' only). */
+  allowWrites?: boolean;
+}
+
+export function createServer(options: CreateServerOptions = {}): Server {
+  const allowWrites =
+    options.allowWrites ?? allowWritesForRequest(effectiveWriteMode('stdio', false), undefined);
   const server = new Server(
     { name: 'saas-alerts-mcp', version: '1.2.9-itsl1' },
     { capabilities: { tools: {}, logging: {}, prompts: {} } }
@@ -22,7 +29,7 @@ export function createServer(): Server {
       const handler = await getDomainHandler(domain);
       allTools.push(...handler.getTools());
     }
-    return { tools: allTools.filter(isAllowedTool) };
+    return { tools: allTools.filter(t => isAllowedTool(t, allowWrites)) };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -35,7 +42,7 @@ export function createServer(): Server {
       known.push(...(await getDomainHandler(domain)).getTools());
     }
     const tool = known.find(t => t.name === name);
-    if (tool && !isAllowedTool(tool)) {
+    if (tool && !isAllowedTool(tool, allowWrites)) {
       logger.warn('Refused tool call: read-only mode', { tool: name });
       return {
         content: [{ type: 'text' as const, text: readOnlyRefusalText(name) }],
@@ -52,7 +59,7 @@ export function createServer(): Server {
         };
       }
       const handler = await getDomainHandler(domain);
-      const tools = handler.getTools().filter(isAllowedTool).map(t => `${t.name}: ${t.description}`);
+      const tools = handler.getTools().filter(t => isAllowedTool(t, allowWrites)).map(t => `${t.name}: ${t.description}`);
       return {
         content: [{ type: 'text' as const, text: `Domain: ${domain}\n\nAvailable tools:\n${tools.join('\n')}` }],
       };
