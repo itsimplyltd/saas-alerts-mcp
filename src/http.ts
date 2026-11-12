@@ -167,6 +167,8 @@ function startHttpServer(): void {
       res,
       {
         secret: s2sSecret || undefined,
+        // Only the MCP_ALLOW_INSECURE_DEV escape hatch may serve without a secret.
+        allowUnauthenticated: !s2sSecret && process.env.MCP_ALLOW_INSECURE_DEV === '1',
         aud: S2S_AUDIENCE,
         floor: 1,
         minVersion,

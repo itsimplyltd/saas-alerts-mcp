@@ -408,6 +408,9 @@ export type GatewayOptions = {
   failureLimiter: ReportRateLimiter; // keyed by reason
   logger: GatewayLogger;
   bodyLimitBytes?: number; // default 5 MB
+  // Only a backend's explicit dev escape hatch may set this. Without it a missing
+  // secret is a deployment fault: the request is refused, never served unauthenticated.
+  allowUnauthenticated?: boolean;
 };
 
 export type VerifiedRequest = { version: number; parsedBody: unknown; headerRuleEnforced: boolean };
@@ -426,6 +429,13 @@ export async function handleGatewayRequest(
     const logFailure = (reason: string): void => {
       if (opts.failureLimiter.shouldEmit(reason)) opts.logger.warn('S2S verification failed', { reason });
     };
+
+    // 0. No secret is a configuration fault unless the dev escape hatch said otherwise.
+    if (!secret && opts.allowUnauthenticated !== true) {
+      logFailure('config');
+      respondAndClose(res, 500, '{"error":"internal_error"}');
+      return;
+    }
 
     // 1. Nothing is buffered for a request that cannot verify.
     if (secret && countHeaders(req.rawHeaders).get(S2S_HEADER) !== 1) {

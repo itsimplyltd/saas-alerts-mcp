@@ -15,6 +15,7 @@ import {
   ReportRateLimiter,
   canonicalV3,
   checkGatewayRequest,
+  handleGatewayRequest,
   formatUnsignedHeaderReport,
   parseV3Header,
   readRawBody,
@@ -23,9 +24,9 @@ import {
   verifyV3,
 } from '../itsl/s2s-v3.js';
 
-// sha256 of itsimplyltd/MCP-Gateway s2s/s2s-v3.ts at commit 03f9945 (branch feat/s2s-v3).
+// sha256 of itsimplyltd/MCP-Gateway s2s/s2s-v3.ts at commit e62a4c8 (branch feat/s2s-v3).
 // Changing the vendored file means re-vendoring the canonical copy, never editing it here.
-const CANONICAL_S2S_V3_SHA256 = '9da3a48ab0b762b48f7b09cad8a23ec6cee9a13cd87e25f812c9673c627b69ab';
+const CANONICAL_S2S_V3_SHA256 = '8ac349ee876af734e11b4fadd9e24eefbfd1707086020990fb6c6ade4b0571d7';
 
 describe('vendored verifier pin', () => {
   it('src/itsl/s2s-v3.ts is byte-identical to the canonical copy', () => {
@@ -224,5 +225,58 @@ describe('verifier behaviour', () => {
     });
     server.close();
     expect(got).toEqual({ status: 413, connection: 'close', body: '{"error":"too_large"}' });
+  });
+});
+
+describe('handleGatewayRequest without a secret', () => {
+  async function serve(allowUnauthenticated?: boolean) {
+    const reached: number[] = [];
+    const server = createServer((req, res) => {
+      void handleGatewayRequest(
+        req,
+        res,
+        {
+          secret: undefined,
+          aud: 'saas-alerts',
+          floor: 1,
+          minVersion: 1,
+          nonceCache: new NonceCache(),
+          reportLimiter: new ReportRateLimiter(),
+          failureLimiter: new ReportRateLimiter(),
+          logger: { warn: () => {}, error: () => {} },
+          allowUnauthenticated,
+        },
+        (v) => {
+          reached.push(v.version);
+          res.end('ok');
+        },
+      );
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as { port: number }).port;
+    const post = () =>
+      new Promise<number>((resolve, reject) => {
+        const rq = httpRequest({ host: '127.0.0.1', port, method: 'POST', path: '/mcp', agent: false }, (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode ?? 0));
+        });
+        rq.on('error', reject);
+        rq.end('{}');
+      });
+    return { reached, post, close: () => new Promise<void>((r) => server.close(() => r())) };
+  }
+
+  it('refuses with 500 and never reaches the handler when the dev flag is absent', async () => {
+    const s = await serve();
+    expect(await s.post()).toBe(500);
+    expect(s.reached).toEqual([]);
+    await s.close();
+  });
+
+  it('serves only when allowUnauthenticated is true', async () => {
+    const s = await serve(true);
+    expect(await s.post()).toBe(200);
+    expect(s.reached).toEqual([0]);
+    await s.close();
   });
 });
